@@ -8,7 +8,7 @@ import { runTransform, runSetup } from "./src/transform/index";
 const program = new Command();
 
 program
-  .name("RanC")
+  .name("RanCC")
   .description("Tool to automatically add translation across your project")
   .version("1.0.0");
 

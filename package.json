@@ -1,11 +1,11 @@
 {
-  "name": "RanC",
+  "name": "rancc",
   "version": "1.0.0",
   "description": "AI-powered i18n automation CLI for React — scan, translate, and transform hardcoded strings into react-i18next calls",
   "type": "module",
   "private": false,
   "bin": {
-    "ranc": "./dist/index.js"
+    "rancc": "./dist/index.js"
   },
   "files": [
     "dist/",

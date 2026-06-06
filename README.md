@@ -1,4 +1,4 @@
-# Edge — AI-Powered i18n Automation CLI for React
+# RanCC — AI-Powered i18n Automation CLI for React
 
 > Built specifically for React projects. Edge takes the grunt work out of internationalization — from extracting strings to rewriting your components — so you can ship multilingual apps without the manual overhead.
 
