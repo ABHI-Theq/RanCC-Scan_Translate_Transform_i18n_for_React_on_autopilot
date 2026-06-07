@@ -1,41 +1,64 @@
 import * as t from "@babel/types";
 import type { NodePath } from "@babel/traverse";
-import { TRANSLATABLE_ATTRIBUTES } from "../../constants";
+
+import {
+  TRANSLATABLE_HTML_ATTRIBUTES,
+  TRANSLATABLE_COMPONENT_PROPS,
+} from "../../constants";
 
 /**
- * Replaces a translatable JSX attribute's string-literal value with `{t("key")}`.
+ * Replaces translatable JSX attribute string literals with {t("key")}
  *
- * Only acts on attributes in TRANSLATABLE_ATTRIBUTES (placeholder, alt, title, …).
- * Skips expression containers, template literals, and anything non-static.
+ * Examples:
+ *   placeholder="Search"
+ *     => placeholder={t("search")}
  *
- * Returns the matched i18n key, or null if no replacement was made.
+ *   label="Save"
+ *     => label={t("save")}
  */
 export function replaceAttribute(
   nodePath: NodePath<t.JSXAttribute>,
   lookup: Map<string, string>,
 ): string | null {
-  const nameNode = nodePath.node.name;
-  const attrName =
-    t.isJSXIdentifier(nameNode) ? nameNode.name :
-    t.isJSXNamespacedName(nameNode) ? `${nameNode.namespace.name}:${nameNode.name.name}` :
-    null;
+  const attrName = nodePath.node.name.name;
 
-  if (!attrName) return null;
-  if (!TRANSLATABLE_ATTRIBUTES.has(attrName)) return null;
+  if (typeof attrName !== "string") {
+    return null;
+  }
+
+  const isHtmlAttribute =
+    TRANSLATABLE_HTML_ATTRIBUTES.has(attrName);
+
+  const isComponentProp =
+    TRANSLATABLE_COMPONENT_PROPS.has(attrName);
+
+  if (!isHtmlAttribute && !isComponentProp) {
+    return null;
+  }
 
   const value = nodePath.node.value;
 
-  // only transform plain string literals — ignore {expr}, template literals, etc.
-  if (!value || !t.isStringLiteral(value)) return null;
+  if (!value || !t.isStringLiteral(value)) {
+    return null;
+  }
 
   const text = value.value.trim();
-  if (!text) return null;
+
+  if (!text) {
+    return null;
+  }
 
   const key = lookup.get(text);
-  if (!key) return null;
+
+  if (!key) {
+    return null;
+  }
 
   nodePath.node.value = t.jsxExpressionContainer(
-    t.callExpression(t.identifier("t"), [t.stringLiteral(key)]),
+    t.callExpression(
+      t.identifier("t"),
+      [t.stringLiteral(key)],
+    ),
   );
 
   return key;

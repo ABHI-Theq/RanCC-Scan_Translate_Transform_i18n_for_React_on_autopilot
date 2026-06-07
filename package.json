@@ -1,6 +1,6 @@
 {
   "name": "rancc",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "AI-powered i18n automation CLI for React — scan, translate, and transform hardcoded strings into react-i18next calls",
   "type": "module",
   "private": false,
@@ -57,6 +57,7 @@
     "chalk": "^5.6.2",
     "commander": "^15.0.0",
     "diff": "^9.0.0",
+    "dotenv": "^17.4.2",
     "fast-glob": "^3.3.3",
     "prettier": "^3.8.3"
   }

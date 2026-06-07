@@ -1,4 +1,7 @@
 #! /usr/bin/env node
+import dotenv  from "dotenv"
+
+dotenv.config()
 import chalk from "chalk";
 import { Command } from "commander";
 import { SetConfig } from "./Text_Extractor/config-ask";
@@ -34,18 +37,18 @@ program
 //get and creat a locale json file of source lan
 program
   .command("scan")
-  .description("This command is to create json text file json of source lang")
-  .action(async () => {
+  .description("Extract UI strings from your React project")
+  .option("--ai", "Use LLM to filter out non-UI strings (uses scanProvider from config)")
+  .option("--review", "Interactively approve/reject each extracted string before saving")
+  .action(async (opts) => {
     try {
-      await runScan();
+      await runScan({ ai: opts.ai ?? false, review: opts.review ?? false });
     } catch (error) {
       if (error instanceof Error && error.message.includes("cancelled")) {
         console.log(chalk.yellow("\n✓ Exited cleanly\n"));
       } else {
         console.log(chalk.red("✗ Scan failed"));
-        console.log(
-          chalk.red(error instanceof Error ? error.message : String(error)),
-        );
+        console.log(chalk.red(error instanceof Error ? error.message : String(error)));
       }
       process.exit(0);
     }

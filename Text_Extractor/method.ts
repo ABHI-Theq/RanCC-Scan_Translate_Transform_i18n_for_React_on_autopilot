@@ -2,8 +2,7 @@ import fg from "fast-glob";
 import fs from "node:fs";
 import path from "node:path";
 import parser from "@babel/parser";
-import traverse from "@babel/traverse";
-import { IGNORE_ATTRIBUTES, SUPPORTED_LANGUAGES } from "../constants";
+import { SUPPORTED_LANGUAGES, TRANSLATABLE_COMPONENT_PROPS, TRANSLATABLE_DATA_KEYS, TRANSLATABLE_FUNCTIONS, TRANSLATABLE_HTML_ATTRIBUTES } from "../constants";
 import type { TransLationConfig } from "../types";
 import chalk from "chalk";
 import { generateText } from "ai";
@@ -11,13 +10,16 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGroq } from "@ai-sdk/groq";
+import {traverse} from "./traverse_import_helper"
+import { addText, type TranslationEntry } from "./extractor";
+import dotenv from "dotenv";
 
 function getModel(provider: string) {
   switch (provider) {
     case "openai":
       return createOpenAI({ apiKey: process.env.OPENAI_API_KEY })("gpt-4o-mini");
     case "google-gemini":
-      return createGoogleGenerativeAI({ apiKey: process.env.GOOGLE_API_KEY })("gemini-2.0-flash");
+      return createGoogleGenerativeAI({ apiKey: process.env.GOOGLE_API_KEY })("gemini-3.1-flash-lite-preview");
     case "claude":
       return createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY })("claude-3-5-haiku-latest");
     case "groq":
@@ -41,12 +43,9 @@ export async function getFilePaths() {
       "**/build/**",
       "**/coverage/**",
       // exclude the CLI's own source so transform doesn't rewrite itself
-      "index.ts",
-      "constants.ts",
-      "types.ts",
-      "Text_Extractor/**",
-      "transform/**",
-      "src/transform/**",
+  "**/*.config.js",
+  "**/*.config.ts",
+  "**/eslint.config.js",
     ],
     cwd: process.cwd(),
   });
@@ -89,58 +88,294 @@ export async function saveConfig(config: TransLationConfig) {
   }
 }
 
+
 export async function scanFiles() {
   const files = await getFilePaths();
 
+  const texts = new Map<string, TranslationEntry>();
 
-  
-  const texts: Record<string,string> = {};
   for (const file of files) {
     const code = fs.readFileSync(file, "utf8");
 
-    const ast = parser.parse(code, {
-      sourceType: "module",
-      plugins: ["jsx", "typescript"],
-    });
+    let ast;
 
-    console.log(`\nScanning: ${file}`);
+    try {
+      ast = parser.parse(code, {
+        sourceType: "unambiguous",
+        plugins: [
+          "jsx",
+          "typescript",
+          "classProperties",
+          "decorators-legacy",
+        ],
+      });
+    } catch (err) {
+      console.warn(`Failed parsing ${file}`);
+      continue;
+    }
+
+    console.log(`Scanning ${file}`);
 
     traverse(ast, {
-      // <h1>Hello</h1>
-      JSXText(path) {
-        const text = path.node.value.trim();
-
-        if (text) {
-          texts[text]=text
-        }
+      // <h1>Hello World</h1>
+      JSXText(path: any) {
+        addText(
+          texts,
+          path.node.value,
+          file,
+          path.node.loc?.start.line ?? 0
+        );
       },
 
-      // placeholder="Search"
-      // alt="Profile"
-      // title="Delete"
-      JSXAttribute(path) {
-        const attrName = path.node.name.name;
+      // placeholder="Search" | alt="Logo" | title="..." | aria-label="..."
+      JSXAttribute(path: any) {
+        const attrName = path.node.name?.name;
 
         if (typeof attrName !== "string") return;
 
-        if (IGNORE_ATTRIBUTES.has(attrName)) return;
+        const isHtmlAttr = TRANSLATABLE_HTML_ATTRIBUTES.has(attrName);
+        const isComponentProp = TRANSLATABLE_COMPONENT_PROPS.has(attrName);
+
+        if (!isHtmlAttr && !isComponentProp) return;
 
         const value = path.node.value;
+        if (!value) return;
 
-        if (value?.type === "StringLiteral") {
-          texts[value.value.trim()]=value.value.trim()
+        // plain string: placeholder="Search"
+        if (value.type === "StringLiteral") {
+          addText(texts, value.value, file, value.loc?.start.line ?? 0);
         }
+
+        // expression string: placeholder={"Search"}
+        if (
+          value.type === "JSXExpressionContainer" &&
+          value.expression?.type === "StringLiteral"
+        ) {
+          addText(texts, value.expression.value, file, value.expression.loc?.start.line ?? 0);
+        }
+      },
+
+      // alert("message") | toast.error("...") | enqueueSnackbar("...")
+      CallExpression(path: any) {
+        const callee = path.node.callee;
+        let functionName: string | undefined;
+
+        if (callee.type === "Identifier") {
+          functionName = callee.name;
+        } else if (
+          callee.type === "MemberExpression" &&
+          callee.property?.type === "Identifier"
+        ) {
+          functionName = callee.property.name;
+        }
+
+        if (!functionName || !TRANSLATABLE_FUNCTIONS.has(functionName)) return;
+
+        const firstArg = path.node.arguments?.[0];
+        if (firstArg?.type === "StringLiteral") {
+          addText(texts, firstArg.value, file, firstArg.loc?.start.line ?? 0);
+        }
+      },
+
+      // Data array patterns:
+      // const items = [{ name: "OpenRouter", usedFor: "...", badge: "Free Tier" }]
+      // Only extracts values from keys listed in TRANSLATABLE_DATA_KEYS
+      ObjectProperty(path: any) {
+        const keyNode = path.node.key;
+        const valueNode = path.node.value;
+
+        // get key name — handles both { name: "x" } and { "name": "x" }
+        const keyName =
+          keyNode?.type === "Identifier" ? keyNode.name :
+          keyNode?.type === "StringLiteral" ? keyNode.value :
+          null;
+
+        if (!keyName) return;
+        if (!TRANSLATABLE_DATA_KEYS.has(keyName)) return;
+        if (valueNode?.type !== "StringLiteral") return;
+
+        addText(texts, valueNode.value, file, valueNode.loc?.start.line ?? 0);
       },
     });
   }
 
-  console.log("\n===== Extracted Strings =====\n");
+  console.log(
+    `\n✓ Extracted ${texts.size} unique strings\n`
+  );
+
+  // return the full entries map so callers have file+line context
   return texts;
 }
 
-// console.log(await scanFiles());
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-export async function runScan() {
+/** Converts the internal Map to the flat locale JSON format. */
+function entriesToLocale(entries: Map<string, TranslationEntry>): Record<string, string> {
+  return Object.fromEntries([...entries.entries()].map(([k, v]) => [k, v.value]));
+}
+
+// ── LLM filter ────────────────────────────────────────────────────────────────
+
+/**
+ * Returns true if the API key env var for the given provider is set and non-empty.
+ */
+function hasApiKey(provider: string): boolean {
+  switch (provider) {
+    case "openai":        return !!process.env.OPENAI_API_KEY;
+    case "google-gemini": return !!process.env.GOOGLE_API_KEY;
+    case "claude":        return !!process.env.ANTHROPIC_API_KEY;
+    case "groq":          return !!process.env.GROQ_API_KEY;
+    case "openrouter":    return !!process.env.OPENROUTER_API_KEY;
+    default:              return false;
+  }
+}
+
+/**
+ * Sends candidate strings to the LLM in batches and asks it to filter down
+ * to only strings that are visible UI text a user would read.
+ * Passes file path + line number as context so the LLM can make better decisions.
+ * Uses config.scanProvider (falls back to config.provider).
+ * If no API key is set, returns candidates unchanged.
+ */
+export async function llmFilterStrings(
+  candidates: Map<string, TranslationEntry>,
+  config: TransLationConfig,
+): Promise<Map<string, TranslationEntry>> {
+  const provider = config.scanProvider || config.provider;
+
+  if (!hasApiKey(provider)) {
+    console.log(
+      chalk.yellow(`  ⚠ No API key found for scan provider "${provider}" — skipping LLM filter.`) +
+        chalk.gray(" Add the key to .env to enable AI filtering."),
+    );
+    return candidates;
+  }
+
+  const model = getModel(provider);
+  const BATCH = 80;
+  const MAX_RETRIES = 2;
+  const allEntries = [...candidates.entries()];
+  const confirmed = new Map<string, TranslationEntry>();
+
+  console.log(chalk.gray(`  → Running LLM filter on ${allEntries.length} candidates via ${provider}...`));
+
+  for (let i = 0; i < allEntries.length; i += BATCH) {
+    const slice = allEntries.slice(i, i + BATCH);
+
+    // send rich context to the LLM: { value, file, line }
+    const batchPayload: Record<string, { value: string; file: string; line: number }> = {};
+    for (const [key, entry] of slice) {
+      batchPayload[key] = { value: entry.value, file: entry.file, line: entry.line };
+    }
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const { text } = await generateText({
+          model,
+          prompt: `You are helping with React app internationalization.
+
+Below is a JSON object of candidate strings extracted from a React codebase.
+Each entry includes the string value, the source file it came from, and the line number.
+Use the file name and line number as context clues — strings in component files on JSX-heavy lines are more likely to be UI text.
+
+Your job: return ONLY the keys whose strings are visible UI text that an end user would actually read in the browser.
+
+REJECT:
+- CSS class names or Tailwind utility strings (e.g. "flex items-center gap-2")
+- CSS values (e.g. "radial-gradient(...)", "0.5s ease", "blur(60px)")
+- SVG path data (e.g. "M 50,50 L 15,20")
+- Technical IDs, model slugs, API identifiers (e.g. "gpt-4o-mini", "openrouter/free")
+- Cron expressions (e.g. "0 9 * * *")
+- Shell/code commands (e.g. "npm install", "git clone ...")
+- Config values, env vars
+- Template placeholders with no surrounding words (e.g. "{value}px")
+- Color codes, hex, rgba
+- Single letters or numbers only
+
+KEEP:
+- Headings, labels, descriptions, badge text
+- Button labels, nav items, error/success messages
+- Any text a real user reads in the UI
+
+Return ONLY a valid JSON array of the keys to KEEP.
+No explanation. No markdown. Just a JSON array of strings.
+
+Candidates:
+${JSON.stringify(batchPayload, null, 2)}`,
+        });
+
+        const cleaned = text.replace(/^```(?:json)?\n?/i, "").replace(/\n?```$/, "").trim();
+        const keysToKeep = JSON.parse(cleaned) as string[];
+
+        if (!Array.isArray(keysToKeep)) throw new Error("Expected JSON array");
+
+        for (const key of keysToKeep) {
+          const entry = candidates.get(key);
+          if (entry) confirmed.set(key, entry);
+        }
+        break;
+      } catch (err: any) {
+        if (attempt === MAX_RETRIES) {
+          console.log(chalk.yellow(`\n    ⚠ LLM filter batch failed, keeping all. (${err.message})`));
+          for (const [key, entry] of slice) confirmed.set(key, entry);
+        } else {
+          await new Promise((r) => setTimeout(r, attempt * 600));
+        }
+      }
+    }
+
+    const done = Math.min(i + BATCH, allEntries.length);
+    const pct = Math.round((done / allEntries.length) * 100);
+    const filled = Math.floor(pct / 5);
+    const bar = chalk.green("█".repeat(filled)) + chalk.gray("░".repeat(20 - filled));
+    process.stdout.write(`\r    [${bar}] ${chalk.yellow(`${pct}%`)} ${chalk.gray(`(${done}/${allEntries.length})`)}`);
+  }
+
+  process.stdout.write("\n");
+  return confirmed;
+}
+
+/**
+ * Interactively presents each string to the developer for approval.
+ * Y = keep, N = discard. Ctrl+C saves progress so far.
+ */
+export async function reviewStrings(
+  entries: Map<string, TranslationEntry>,
+): Promise<Map<string, TranslationEntry>> {
+  const { confirm, isCancel } = await import("@clack/prompts");
+  const allEntries = [...entries.entries()];
+  const approved = new Map<string, TranslationEntry>();
+
+  console.log(chalk.cyan(`\n  Reviewing ${allEntries.length} extracted strings.`));
+  console.log(chalk.gray("  Y = keep, N = discard. Ctrl+C saves progress.\n"));
+
+  for (let idx = 0; idx < allEntries.length; idx++) {
+    const [key, entry] = allEntries[idx]!;
+    const prefix = chalk.gray(`  [${idx + 1}/${allEntries.length}]`);
+    const location = chalk.dim(`${entry.file}:${entry.line}`);
+    console.log(`${prefix} ${chalk.white(key)} ${location}`);
+
+    const keep = await confirm({ message: "Keep?" });
+
+    if (isCancel(keep)) {
+      console.log(chalk.yellow("\n  Review interrupted — saving approved strings so far.\n"));
+      break;
+    }
+
+    if (keep === true) approved.set(key, entry);
+  }
+
+  return approved;
+}
+
+export interface ScanOptions {
+  ai: boolean;
+  review: boolean;
+}
+
+export async function runScan(options: ScanOptions = { ai: false, review: false }) {
+  const { ai, review } = options;
+
   console.log(chalk.cyan("\n┌─────────────────────────────────┐"));
   console.log(chalk.cyan("│      🔍  Starting i18n Scan      │"));
   console.log(chalk.cyan("└─────────────────────────────────┘\n"));
@@ -154,11 +389,48 @@ export async function runScan() {
   }
   console.log(chalk.green(`  ✓ Config loaded`) + chalk.gray(` (source: ${config.sourceLang})`));
 
-  // scan files
-  console.log(chalk.gray("\n  → Scanning project files...\n"));
-  const allTexts = await scanFiles();
+  const scanProvider = config.scanProvider || config.provider;
+
+  if (ai) {
+    if (hasApiKey(scanProvider)) {
+      console.log(chalk.cyan(`  ✦ AI filter enabled`) + chalk.gray(` (provider: ${scanProvider})\n`));
+    } else {
+      console.log(
+        chalk.yellow(`  ⚠ --ai requested but no key for "${scanProvider}" — using heuristic filter only.\n`),
+      );
+    }
+  }
+
+  if (review) {
+    console.log(chalk.cyan("  ✦ Review mode — you will approve each string interactively\n"));
+  }
+
+  // scan files — returns rich Map<string, TranslationEntry>
+  console.log(chalk.gray("  → Scanning project files...\n"));
+  let entries = await scanFiles();
+  const rawCount = entries.size;
+  console.log(chalk.green(`  ✓ Extracted ${chalk.bold(rawCount)} candidate strings`));
+
+  // LLM filter pass (auto-skips if no key)
+  if (ai) {
+    console.log(chalk.gray("\n  → Filtering with AI...\n"));
+    entries = await llmFilterStrings(entries, config);
+    const filteredCount = entries.size;
+    console.log(
+      chalk.green(`  ✓ AI kept ${chalk.bold(filteredCount)} strings`) +
+        chalk.gray(` (removed ${rawCount - filteredCount} non-UI strings)`),
+    );
+  }
+
+  // interactive review pass
+  if (review) {
+    entries = await reviewStrings(entries);
+    console.log(chalk.green(`  ✓ Review complete — ${entries.size} strings approved`));
+  }
+
+  // convert to flat locale JSON
+  const allTexts = entriesToLocale(entries);
   const count = Object.keys(allTexts).length;
-  console.log(chalk.green(`  ✓ Extracted ${chalk.bold(count)} strings`));
 
   // ensure locale dir exists
   await folderExists(config.localeDir);
@@ -167,7 +439,7 @@ export async function runScan() {
   // write file
   const FILE_PATH = path.join(config.localeDir, `${config.sourceLang}.json`);
   fs.writeFileSync(FILE_PATH, JSON.stringify(allTexts, null, 2));
-  console.log(chalk.green(`  ✓ Saved to `) + chalk.cyan(FILE_PATH));
+  console.log(chalk.green(`  ✓ Saved ${chalk.bold(count)} strings to `) + chalk.cyan(FILE_PATH));
 
   console.log(chalk.cyan("\n✨ Scan complete!\n"));
 }
@@ -203,6 +475,9 @@ export async function runTranslate() {
   console.log(chalk.cyan("│      🌍  Starting i18n Translate      │"));
   console.log(chalk.cyan("└──────────────────────────────────────┘\n"));
 
+  console.log(chalk.gray("loading key "))
+  dotenv.config()
+  
   // 1. load config
   console.log(chalk.gray("  → Loading config..."));
   const config = await loadConfig();
